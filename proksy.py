@@ -18,9 +18,35 @@ import socket
 from typing import List, Dict, Tuple, Optional, Union
 import ipaddress
 import re
+import logging
+from logging.handlers import RotatingFileHandler
+
+# Loglama sistemini kur
+def setup_logging():
+    """Loglama sistemini kurar."""
+    log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    
+    # Dosya handler
+    file_handler = RotatingFileHandler('proxy_checker.log', maxBytes=5*1024*1024, backupCount=3)
+    file_handler.setFormatter(log_formatter)
+    file_handler.setLevel(logging.INFO)
+    
+    # Konsol handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(log_formatter)
+    console_handler.setLevel(logging.ERROR)
+    
+    # Logger'ı ayarla
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
 
 # `colorama`'yı başlatıyoruz
 init(autoreset=True)
+logger = setup_logging()
 
 class ProxyManager:
     def __init__(self):
@@ -31,6 +57,7 @@ class ProxyManager:
         }
         self.working_proxies_file = "calisan_proxyler.txt"
         self.hidemy_io_file = "hidemy_io_format.txt"
+        self.failed_proxies_file = "calismayan_proxyler.txt"
         self.stats = {
             'total_tested': 0,
             'working_count': 0,
@@ -43,8 +70,9 @@ class ProxyManager:
             }
         }
         self.geoip_cache = {}
+        self.failed_proxies = []
         
-        # Coğrafi konum veritabanı (genişletilmiş versiyon)
+        # Coğrafi konum veritabanı
         self.country_codes = {
             'US': 'United States', 'DE': 'Germany', 'FR': 'France', 
             'GB': 'United Kingdom', 'NL': 'Netherlands', 'RU': 'Russia',
@@ -94,7 +122,7 @@ class ProxyManager:
             'TZ': 'Tanzania', 'UG': 'Uganda', 'ZM': 'Zambia', 'ZW': 'Zimbabwe',
             'DZ': 'Algeria', 'AO': 'Angola', 'BJ': 'Benin', 'BW': 'Botswana',
             'BF': 'Burkina Faso', 'BI': 'Burundi', 'CM': 'Cameroon', 'CV': 'Cape Verde',
-            'TD': 'Chad', 'KM': 'Comoros', 'CI': 'Côte d'Ivoire', 'GQ': 'Equatorial Guinea',
+            'TD': 'Chad', 'KM': 'Comoros', 'CI': 'Côte dIvoire', 'GQ': 'Equatorial Guinea',
             'GA': 'Gabon', 'GM': 'Gambia', 'GH': 'Ghana', 'GN': 'Guinea', 'GW': 'Guinea-Bissau',
             'LR': 'Liberia', 'LY': 'Libya', 'ML': 'Mali', 'MR': 'Mauritania', 'MA': 'Morocco',
             'NE': 'Niger', 'SN': 'Senegal', 'SL': 'Sierra Leone', 'TG': 'Togo', 'TN': 'Tunisia'
@@ -107,7 +135,7 @@ class ProxyManager:
                          max_tries=3,
                          max_time=30)
     def send_request(self, url: str, retries: int = 3) -> Optional[str]:
-        """Verilen URL'ye HTTP GET isteği gönderir ve dönen içeriği alır. Hata durumunda tekrar dener."""
+        """Verilen URL'ye HTTP GET isteği gönderir ve dönen içeriği alır."""
         try:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
@@ -118,23 +146,26 @@ class ProxyManager:
             response = requests.get(url, headers=headers, timeout=15)
             response.raise_for_status()
             return response.text
-        except (requests.exceptions.RequestException, 
-                requests.exceptions.Timeout,
-                socket.gaierror) as e:
+        except Exception as e:
+            logger.warning(f"İstek hatası: {e}, URL: {url}")
             if retries > 0:
                 print(f"{Fore.YELLOW}⏳ {retries} deneme kaldı. 2 saniye bekleniyor...{Style.RESET_ALL}")
                 time.sleep(2)
                 return self.send_request(url, retries - 1)
             else:
-                print(f"{Fore.RED}❌ İstek başarısız: {e}{Style.RESET_ALL}")
+                logger.error(f"İstek başarısız: {e}, URL: {url}")
                 return None
 
     async def test_proxy_async(self, session: aiohttp.ClientSession, proxy: str, proxy_type: str) -> Optional[Dict]:
         """Proxy'yi asenkron olarak test eder."""
         try:
+            # Proxy formatını doğrula
+            if not self.validate_proxy_format(proxy):
+                return None
+                
             proxies = f"{proxy_type}://{proxy}"
             
-            # Test siteleri
+            # Daha güvenilir test siteleri
             test_urls = [
                 "https://httpbin.org/ip",
                 "https://api.ipify.org?format=json",
@@ -149,11 +180,16 @@ class ProxyManager:
             for test_url in test_sites:
                 try:
                     start_time = time.time()
-                    async with session.get(test_url, proxy=proxies, timeout=8) as response:
+                    async with session.get(test_url, proxy=proxies, timeout=10, ssl=False) as response:
                         if response.status == 200:
+                            # Gerçekten çalıştığını doğrulamak için içerik kontrolü
+                            content = await response.text()
+                            if test_url == "https://httpbin.org/ip" and '"origin"' not in content:
+                                continue
                             success_count += 1
                             response_time = time.time() - start_time
-                except:
+                except Exception as e:
+                    logger.debug(f"Proxy test hatası: {e}, Proxy: {proxy}")
                     continue
             
             # 2 testten en az 1'inde başarılı olmalı
@@ -170,12 +206,30 @@ class ProxyManager:
                     'score': self.calculate_proxy_score(response_time, country)
                 }
                 
+                logger.info(f"Çalışan proxy: {proxy}, Tip: {proxy_type}, Süre: {response_time:.2f}s")
                 return proxy_data
             else:
+                self.failed_proxies.append(proxy)
                 return None
                 
-        except Exception:
+        except Exception as e:
+            logger.error(f"Proxy test istisnası: {e}, Proxy: {proxy}")
+            self.failed_proxies.append(proxy)
             return None
+
+    def validate_proxy_format(self, proxy: str) -> bool:
+        """Proxy formatını doğrular."""
+        try:
+            ip, port = proxy.split(':')
+            # IP adresini doğrula
+            ipaddress.ip_address(ip)
+            # Port numarasını doğrula
+            port_num = int(port)
+            if not (1 <= port_num <= 65535):
+                return False
+            return True
+        except (ValueError, Exception):
+            return False
 
     async def get_proxy_country(self, session: aiohttp.ClientSession, proxy: str, proxy_type: str) -> str:
         """Proxy'nin coğrafi konumunu belirler."""
@@ -229,7 +283,7 @@ class ProxyManager:
         final_score = int((time_score * 0.7) + (country_score * 0.3))
         return min(100, max(1, final_score))
 
-    async def test_all_proxies_async(self, proxy_list: List[str], proxy_type: str, max_workers: int = 20) -> None:
+    async def test_all_proxies_async(self, proxy_list: List[str], proxy_type: str, max_workers: int = 15) -> None:
         """Tüm proxy'leri asenkron olarak test eder."""
         print(f"\n{Fore.YELLOW}🔍 {proxy_type.upper()} proxy'leri test ediliyor... ({len(proxy_list)} adet){Style.RESET_ALL}")
         
@@ -245,7 +299,7 @@ class ProxyManager:
                  unit="proxy", ncols=80) as pbar:
             
             connector = aiohttp.TCPConnector(limit=max_workers, limit_per_host=5)
-            timeout = aiohttp.ClientTimeout(total=10, sock_connect=5, sock_read=5)
+            timeout = aiohttp.ClientTimeout(total=15, sock_connect=8, sock_read=8)
             
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 tasks = []
@@ -348,6 +402,25 @@ class ProxyManager:
         except Exception as e:
             print(f"{Fore.RED}❌ Çalışan proxy'ler kaydedilirken hata oluştu: {e}{Style.RESET_ALL}")
 
+    def save_failed_proxies(self):
+        """Çalışmayan proxy'leri dosyaya kaydeder."""
+        if not self.failed_proxies:
+            return
+        
+        try:
+            with open(self.failed_proxies_file, 'w', encoding='utf-8') as f:
+                f.write("# ÇALIŞMAYAN PROXY LİSTESİ\n")
+                f.write(f"# Oluşturulma tarihi: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"# Toplam çalışmayan proxy: {len(self.failed_proxies)}\n\n")
+                
+                for proxy in self.failed_proxies:
+                    f.write(f"{proxy}\n")
+            
+            print(f"{Fore.YELLOW}⚠️ Çalışmayan proxy'ler '{self.failed_proxies_file}' dosyasına kaydedildi.{Style.RESET_ALL}")
+            
+        except Exception as e:
+            logger.error(f"Çalışmayan proxy'ler kaydedilirken hata: {e}")
+
     def show_stats(self) -> None:
         """İstatistikleri gösterir."""
         total_time = (datetime.now() - self.stats['start_time']).total_seconds()
@@ -402,20 +475,75 @@ class ProxyManager:
     def check_for_updates(self) -> bool:
         """Güncelleme kontrolü yapar."""
         try:
-            # Basit bir güncelleme kontrolü
-            update_url = "https://api.github.com/repos/b3y4z/proxy-checker/releases/latest"
-            response = requests.get(update_url, timeout=10)
+            # GitHub API'sinden en son sürüm bilgisini al
+            # BU URL SİZİN REPONUZ İÇİN ÇALIŞACAKTIR
+            update_url = "https://api.github.com/repos/bilisimindex/proksy.py/releases/latest"
+            
+            # GitHub API'si için User-Agent header'ı ekle (gerekli)
+            headers = {
+                'User-Agent': 'ProxyChecker-App',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            
+            response = requests.get(update_url, headers=headers, timeout=10)
+            
             if response.status_code == 200:
                 data = response.json()
                 latest_version = data.get('tag_name', 'v1.0')
-                current_version = "v2.0"  # Bu değer dinamik olmalı
+                download_url = data.get('html_url', 'https://github.com/bilisimindex/proksy.py')
+                assets = data.get('assets', [])
+                
+                # Mevcut versiyonu dosyadan oku
+                try:
+                    with open('version.txt', 'r') as f:
+                        current_version = f.read().strip()
+                except:
+                    current_version = "v1.0"  # Varsayılan değer
+                
+                print(f"{Fore.CYAN}🔍 Güncelleme kontrol ediliyor...{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}► Mevcut versiyon: {current_version}{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}► En son versiyon: {latest_version}{Style.RESET_ALL}")
                 
                 if latest_version != current_version:
-                    print(f"{Fore.YELLOW}⚠️ Yeni versiyon mevcut: {latest_version} (şu anki: {current_version}){Style.RESET_ALL}")
-                    print(f"{Fore.YELLOW}📥 İndirmek için: {data.get('html_url', '')}{Style.RESET_ALL}")
+                    print(f"{Fore.YELLOW}⚠️ Yeni versiyon mevcut: {latest_version}{Style.RESET_ALL}")
+                    print(f"{Fore.YELLOW}📥 İndirmek için: {download_url}{Style.RESET_ALL}")
+                    
+                    # Asset'leri (dosyaları) göster
+                    if assets:
+                        print(f"{Fore.YELLOW}📦 İndirilebilir dosyalar:{Style.RESET_ALL}")
+                        for asset in assets[:3]:  # İlk 3 dosyayı göster
+                            print(f"{Fore.YELLOW}   ► {asset['name']} ({asset['size']} bytes){Style.RESET_ALL}")
+                    
+                    # Güncelleme yapma seçeneği sun
+                    choice = input(f"\n{Fore.YELLOW}Güncelleme sayfasını açmak ister misiniz? (E/H): {Style.RESET_ALL}")
+                    if choice.lower() == 'e':
+                        webbrowser.open(download_url)
+                        print(f"{Fore.GREEN}📋 Tarayıcıda güncelleme sayfası açıldı.{Style.RESET_ALL}")
+                    
                     return True
-            return False
-        except:
+                else:
+                    print(f"{Fore.GREEN}✅ Program zaten güncel.{Style.RESET_ALL}")
+                    return False
+                    
+            elif response.status_code == 404:
+                print(f"{Fore.YELLOW}⚠️ Releases bulunamadı. GitHub'da release oluşturmalısınız.{Style.RESET_ALL}")
+                print(f"{Fore.YELLOW}📝 https://github.com/bilisimindex/proksy.py/releases/new{Style.RESET_ALL}")
+                
+                # Yine de GitHub sayfasını açma seçeneği sun
+                choice = input(f"\n{Fore.YELLOW}GitHub sayfasını açmak ister misiniz? (E/H): {Style.RESET_ALL}")
+                if choice.lower() == 'e':
+                    webbrowser.open("https://github.com/bilisimindex/proksy.py")
+                    print(f"{Fore.GREEN}📋 Tarayıcıda GitHub sayfası açıldı.{Style.RESET_ALL}")
+                
+                return False
+                
+            else:
+                print(f"{Fore.YELLOW}⚠️ Güncelleme kontrolü yapılamadı. HTTP {response.status_code}{Style.RESET_ALL}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Güncelleme kontrolü hatası: {e}")
+            print(f"{Fore.RED}❌ Güncelleme kontrolü hatası: {e}{Style.RESET_ALL}")
             return False
 
 def spinner(stop_event, message="Proxy verisi çekiliyor..."):
@@ -524,10 +652,8 @@ def open_browser_for_proxy_check():
         else:
             print(f"{Fore.RED}Geçersiz giriş! Lütfen 'E' veya 'H' tuşlayın.{Style.RESET_ALL}")
 
-def main():
-    os.system('cls' if os.name == 'nt' else 'clear')
-    
-    # Renkli banner
+def print_banner():
+    """Renkli banner yazdırır."""
     banner = f'''
 {Fore.CYAN}╔══════════════════════════════════════════════════════════════╗{Style.RESET_ALL}
 {Fore.CYAN}║                                                              ║{Style.RESET_ALL}
@@ -542,87 +668,105 @@ def main():
 {Fore.CYAN}║  {Fore.GREEN}[ Coded By B3ʯ4z - Gelişmiş Sürüm v2.0 ]  {Fore.CYAN}║{Style.RESET_ALL}
 {Fore.CYAN}║  {Fore.WHITE}PROTOCOL: {Fore.GREEN}HTTP/S {Fore.WHITE}| {Fore.CYAN}SOCKS4 {Fore.WHITE}| {Fore.RED}SOCKS5 {Fore.CYAN}║{Style.RESET_ALL}
 {Fore.CYAN}║  {Fore.WHITE}FEATURES: {Fore.CYAN}ASYNC {Fore.WHITE}| {Fore.YELLOW}GEOIP {Fore.WHITE}| {Fore.GREEN}SCORING {Fore.CYAN}║{Style.RESET_ALL}
+{Fore.CYAN}║  {Fore.WHITE}GITHUB: {Fore.CYAN}https://github.com/bilisimindex/proksy.py {Fore.CYAN}║{Style.RESET_ALL}
 {Fore.CYAN}║                                                              ║{Style.RESET_ALL}
 {Fore.CYAN}╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}
     '''
     print(banner)
 
-    # Güncelleme kontrolü
-    proxy_manager = ProxyManager()
-    proxy_manager.check_for_updates()
-
-    # Proxy dosyalarını aç
-    with open('http.txt', 'wb') as http, open('socks4.txt', 'wb') as socks4, open('socks5.txt', 'wb') as socks5:
-
-        # Kaynaklar
-        http_sources = [
-            {"name": "🛡 ProxyScrape HTTP", "url": "https://api.proxyscrape.com/v4/free-proxy-list/get?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all&skip=0&limit=2000"},
-            {"name": "🛡 ProxyList HTTP", "url": "https://www.proxylist.day/http.txt"},
-            {"name": "🛡 FreeProxyList HTTP", "url": "https://free-proxy-list.net/anonymous-proxy.html"},
-        ]
-
-        socks4_sources = [
-            {"name": "🧦 ProxyScrape SOCKS4", "url": "https://api.proxyscrape.com/v4/free-proxy-list-get?request=displayproxies&protocol=socks4&timeout=10000&country=all&ssl=all&anonymity=all&skip=0&limit=2000"},
-            {"name": "🧦 SOCKS4 ProxyList", "url": "https://www.proxylist.day/socks4.txt"},
-            {"name": "🧦 SocksProxy SOCKS4", "url": "https://www.socks-proxy.net/"},
-        ]
-
-        socks5_sources = [
-            {"name": "🔥 ProxyScrape SOCKS5", "url": "https://api.proxyscrape.com/v4/free-proxy-list/get?request=displayproxies&protocol=socks5&timeout=10000&country=all&ssl=all&anonymity=all&skip=0&limit=2000"},
-            {"name": "🔥 SOCKS5 ProxyList", "url": "https://www.proxylist.day/socks5.txt"},
-            {"name": "🔥 SocksProxy SOCKS5", "url": "https://www.socks-proxy.net/"},
-        ]
-
-        # Protokollere göre kaynak seçimi
-        selected_http = select_sources("HTTP", http_sources)
-        selected_socks4 = select_sources("SOCKS4", socks4_sources)
-        selected_socks5 = select_sources("SOCKS5", socks5_sources)
-
-        # Proxy listelerini dosyalara kaydet ve içerikleri al
-        http_content = save_proxy_file(http, selected_http["url"], selected_http["name"])
-        socks4_content = save_proxy_file(socks4, selected_socks4["url"], selected_socks4["name"])
-        socks5_content = save_proxy_file(socks5, selected_socks5["url"], selected_socks5["name"])
-
-    # Proxy listelerini ayrıştır
-    http_proxies = parse_proxy_content(http_content, "HTTP")
-    socks4_proxies = parse_proxy_content(socks4_content, "SOCKS4")
-    socks5_proxies = parse_proxy_content(socks5_content, "SOCKS5")
-
-    # Toplam proxy sayısını güncelle
-    proxy_manager.stats['total_tested'] = len(http_proxies) + len(socks4_proxies) + len(socks5_proxies)
-
-    # Proxy'leri test et
-    if http_proxies:
-        proxy_manager.test_all_proxies(http_proxies, "http")
-    
-    if socks4_proxies:
-        proxy_manager.test_all_proxies(socks4_proxies, "socks4")
-    
-    if socks5_proxies:
-        proxy_manager.test_all_proxies(socks5_proxies, "socks5")
-
-    # Çalışan proxy'leri kaydet
-    proxy_manager.save_working_proxies()
-    
-    # İstatistikleri göster
-    proxy_manager.show_stats()
-    
-    # Proxy tablosunu göster
-    proxy_manager.show_proxy_table()
-
-    # Hidemy.io ile doğrulama
-    open_browser_for_proxy_check()
-
-    # Teşekkür ve çıkış
-    print(f"\n{Fore.YELLOW}[ℹ️] Programı kapatabilirsiniz.{Style.RESET_ALL}")
-    print(f"{Fore.YELLOW}Araçlarımı kullandığınız için teşekkürler 😊{Style.RESET_ALL}")
-    
-    input(f"\n{Fore.YELLOW}Çıkış yapmak için Enter'a basın...{Style.RESET_ALL}")
-    print(f"\n\n{Fore.MAGENTA}Made with ❤️ by b3y4z{Style.RESET_ALL}\n\n")
-
-if __name__ == "__main__":
-    # Asenkron işlemler için event loop politikasını ayarla
+def main():
+    # Windows için asenkron politikası
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
+    os.system('cls' if os.name == 'nt' else 'clear')
+    
+    # Banner göster
+    print_banner()
+    
+    # Güncelleme kontrolü
+    proxy_manager = ProxyManager()
+    proxy_manager.check_for_updates()
+    
+    try:
+        # Proxy dosyalarını aç
+        with open('http.txt', 'wb') as http, open('socks4.txt', 'wb') as socks4, open('socks5.txt', 'wb') as socks5:
+
+            # Kaynaklar
+            http_sources = [
+                {"name": "🛡 ProxyScrape HTTP", "url": "https://api.proxyscrape.com/v4/free-proxy-list/get?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all&skip=0&limit=2000"},
+                {"name": "🛡 ProxyList HTTP", "url": "https://www.proxylist.day/http.txt"},
+                {"name": "🛡 FreeProxyList HTTP", "url": "https://free-proxy-list.net/anonymous-proxy.html"},
+            ]
+
+            socks4_sources = [
+                {"name": "🧦 ProxyScrape SOCKS4", "url": "https://api.proxyscrape.com/v4/free-proxy-list/get?request=displayproxies&protocol=socks4&timeout=10000&country=all&ssl=all&anonymity=all&skip=0&limit=2000"},
+                {"name": "🧦 SOCKS4 ProxyList", "url": "https://www.proxylist.day/socks4.txt"},
+                {"name": "🧦 SocksProxy SOCKS4", "url": "https://www.socks-proxy.net/"},
+            ]
+
+            socks5_sources = [
+                {"name": "🔥 ProxyScrape SOCKS5", "url": "https://api.proxyscrape.com/v4/free-proxy-list/get?request=displayproxies&protocol=socks5&timeout=10000&country=all&ssl=all&anonymity=all&skip=0&limit=2000"},
+                {"name": "🔥 SOCKS5 ProxyList", "url": "https://www.proxylist.day/socks5.txt"},
+                {"name": "🔥 SocksProxy SOCKS5", "url": "https://www.socks-proxy.net/"},
+            ]
+
+            # Protokollere göre kaynak seçimi
+            selected_http = select_sources("HTTP", http_sources)
+            selected_socks4 = select_sources("SOCKS4", socks4_sources)
+            selected_socks5 = select_sources("SOCKS5", socks5_sources)
+
+            # Proxy listelerini dosyalara kaydet ve içerikleri al
+            http_content = save_proxy_file(http, selected_http["url"], selected_http["name"])
+            socks4_content = save_proxy_file(socks4, selected_socks4["url"], selected_socks4["name"])
+            socks5_content = save_proxy_file(socks5, selected_socks5["url"], selected_socks5["name"])
+
+        # Proxy listelerini ayrıştır
+        http_proxies = parse_proxy_content(http_content, "HTTP")
+        socks4_proxies = parse_proxy_content(socks4_content, "SOCKS4")
+        socks5_proxies = parse_proxy_content(socks5_content, "SOCKS5")
+
+        # Toplam proxy sayısını güncelle
+        proxy_manager.stats['total_tested'] = len(http_proxies) + len(socks4_proxies) + len(socks5_proxies)
+
+        # Proxy'leri test et
+        if http_proxies:
+            proxy_manager.test_all_proxies(http_proxies, "http")
+        
+        if socks4_proxies:
+            proxy_manager.test_all_proxies(socks4_proxies, "socks4")
+        
+        if socks5_proxies:
+            proxy_manager.test_all_proxies(socks5_proxies, "socks5")
+
+        # Çalışan proxy'leri kaydet
+        proxy_manager.save_working_proxies()
+        
+        # Çalışmayan proxy'leri kaydet
+        proxy_manager.save_failed_proxies()
+        
+        # İstatistikleri göster
+        proxy_manager.show_stats()
+        
+        # Proxy tablosunu göster
+        proxy_manager.show_proxy_table()
+
+        # Hidemy.io ile doğrulama
+        open_browser_for_proxy_check()
+
+    except KeyboardInterrupt:
+        print(f"\n{Fore.RED}❌ Program kullanıcı tarafından durduruldu.{Style.RESET_ALL}")
+        logger.info("Program kullanıcı tarafından durduruldu")
+    except Exception as e:
+        print(f"\n{Fore.RED}❌ Beklenmeyen bir hata oluştu: {e}{Style.RESET_ALL}")
+        logger.error(f"Beklenmeyen hata: {e}", exc_info=True)
+    finally:
+        # Teşekkür ve çıkış
+        print(f"\n{Fore.YELLOW}[ℹ️] Programı kapatabilirsiniz.{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Araçlarımı kullandığınız için teşekkürler 😊{Style.RESET_ALL}")
+        
+        input(f"\n{Fore.YELLOW}Çıkış yapmak için Enter'a basın...{Style.RESET_ALL}")
+        print(f"\n\n{Fore.MAGENTA}Made with ❤️ by b3y4z{Style.RESET_ALL}\n\n")
+
+if __name__ == "__main__":
     main()
